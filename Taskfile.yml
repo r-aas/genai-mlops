@@ -1,0 +1,231 @@
+# GenAI MLOps Stack — Taskfile
+# Usage: task <name>  |  task --list
+version: "3"
+
+dotenv:
+  - .env.local
+  - .env
+  - .env.example
+
+tasks:
+  default:
+    desc: List available tasks
+    silent: true
+    cmds:
+      - task --list
+
+  # ── Setup ─────────────────────────────────────────────────────────────────────
+
+  setup:
+    desc: Bootstrap project (sync deps, create .env, init secrets)
+    cmds:
+      - uv sync
+      - cmd: cp -n .env.example .env 2>/dev/null || true
+        silent: true
+      - bash scripts/init-secrets.sh
+      - mkdir -p data
+
+  init-secrets:
+    desc: Generate Docker secrets (idempotent — skips existing)
+    cmds:
+      - bash scripts/init-secrets.sh
+
+  reset-secrets:
+    desc: Regenerate all secrets (DESTRUCTIVE — overwrites existing)
+    cmds:
+      - bash scripts/init-secrets.sh --force
+
+  # ── Lifecycle ─────────────────────────────────────────────────────────────────
+
+  dev:
+    desc: Start the full stack (generates secrets if missing, builds images)
+    deps: [init-secrets]
+    cmds:
+      - docker compose up -d --build
+      - |
+        docker wait genai-n8n-import 2>/dev/null || true
+        if docker logs genai-n8n-import 2>&1 | grep -q "Workflows imported and activated"; then
+          docker compose restart n8n
+          echo "n8n restarted to register imported webhooks."
+        fi
+        true
+      - task: seed-prompts
+
+  up:
+    desc: Start the stack (no build)
+    deps: [init-secrets]
+    cmds:
+      - docker compose up -d
+
+  stop:
+    desc: Stop all services
+    cmds:
+      - docker compose down
+
+  nuke:
+    desc: Stop and remove volumes (DESTRUCTIVE — loses all data)
+    prompt: This will destroy all local data. Continue?
+    cmds:
+      - docker compose down -v
+
+  restart:
+    desc: Restart a specific service (task restart -- mlflow)
+    cmds:
+      - docker compose restart {{.CLI_ARGS}}
+
+  rebuild:
+    desc: Rebuild and restart a specific service (task rebuild -- mlflow)
+    cmds:
+      - docker compose up -d --build {{.CLI_ARGS}}
+
+  # ── Logs ──────────────────────────────────────────────────────────────────────
+
+  logs:
+    desc: Tail logs for all services
+    cmds:
+      - docker compose logs -f
+
+  log:
+    desc: Tail logs for a specific service (task log -- mlflow)
+    cmds:
+      - docker compose logs -f {{.CLI_ARGS}}
+
+  # ── Status ────────────────────────────────────────────────────────────────────
+
+  ps:
+    desc: Show running containers
+    cmds:
+      - docker compose ps
+
+  health:
+    desc: Health check all services
+    silent: true
+    cmds:
+      - |
+        echo "── MLflow ──"
+        curl -sf http://localhost:${MLFLOW_PORT:-5050}/health && echo " ✓ healthy" || echo " ✗ down"
+        echo "── n8n ──"
+        curl -sf http://localhost:${N8N_PORT:-5678}/healthz && echo " ✓ healthy" || echo " ✗ down"
+        echo "── MinIO ──"
+        curl -sf http://localhost:${MINIO_PORT:-9000}/minio/health/live && echo " ✓ healthy" || echo " ✗ down"
+
+  open:
+    desc: Print all service URLs
+    silent: true
+    cmds:
+      - |
+        echo "MLflow:       http://localhost:${MLFLOW_PORT:-5050}"
+        echo "n8n:          http://localhost:${N8N_PORT:-5678}"
+        echo "MinIO API:    http://localhost:${MINIO_PORT:-9000}"
+        echo "MinIO Console:http://localhost:9001"
+
+  # ── Doctor ────────────────────────────────────────────────────────────────────
+
+  doctor:
+    desc: Verify environment health
+    silent: true
+    cmds:
+      - |
+        ok=true
+        check() {
+          if command -v "$1" &>/dev/null; then
+            printf "  ✓ %-18s %s\n" "$1" "$("$@" 2>&1 | head -1)"
+          else
+            printf "  ✗ %-18s MISSING\n" "$1"
+            ok=false
+          fi
+        }
+        echo "── Host Prerequisites ──"
+        check docker --version
+        check docker compose version
+        check task --version
+        check uv --version
+        check curl --version
+        echo ""
+        echo "── Ollama ──"
+        if curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then
+          echo "  ✓ Ollama             http://localhost:11434"
+        else
+          echo "  ✗ Ollama             NOT REACHABLE at http://localhost:11434"
+          ok=false
+        fi
+        echo ""
+        echo "── Docker Daemon ──"
+        if docker info &>/dev/null; then
+          echo "  ✓ Docker daemon      running"
+        else
+          echo "  ✗ Docker daemon      NOT RUNNING"
+          ok=false
+        fi
+        echo ""
+        echo "── Secrets ──"
+        if [ -d secrets ] && [ -f secrets/n8n_postgres_password ]; then
+          echo "  ✓ Secrets            initialized"
+        else
+          echo "  ⚠ Secrets            not initialized (run: task init-secrets)"
+        fi
+        echo ""
+        if [ "$ok" = true ]; then
+          echo "All required tools present. Run 'task dev' to start the stack."
+        else
+          echo "Some tools are missing or unreachable. Fix the issues above."
+          exit 1
+        fi
+
+  # ── Python / Quality ──────────────────────────────────────────────────────────
+
+  lint:
+    desc: Lint Python files
+    cmds:
+      - uv run --group dev ruff check .
+
+  fmt:
+    desc: Format Python files
+    cmds:
+      - uv run --group dev ruff format .
+
+  test:
+    desc: Run tests
+    cmds:
+      - uv run --group dev pytest {{.CLI_ARGS}}
+
+  # ── Workflows ─────────────────────────────────────────────────────────────
+
+  import-workflow:
+    desc: Re-import workflow JSON into n8n (overwrites existing)
+    cmds:
+      - |
+        docker compose run --rm --entrypoint /bin/sh n8n-import -c '
+          export N8N_ENCRYPTION_KEY=$(cat /run/secrets/n8n_encryption_key)
+          export DB_POSTGRESDB_PASSWORD=$(cat /run/secrets/n8n_postgres_password)
+          n8n import:workflow --separate --input=/demo-data/workflows
+          n8n update:workflow --id=ollama-webhook-v1 --active=true
+          n8n update:workflow --id=prompt-ollama-v1 --active=true
+          n8n update:workflow --id=prompt-crud-v1 --active=true
+          n8n update:workflow --id=prompt-eval-v1 --active=true
+          echo "Workflows imported and activated."
+        '
+      - docker compose restart n8n
+      - echo "n8n restarted to register webhooks."
+
+  seed-prompts:
+    desc: Seed MLflow Prompt Registry with starter prompts
+    cmds:
+      - uv run python scripts/seed_prompts.py
+
+  # ── Housekeeping ──────────────────────────────────────────────────────────────
+
+  clean:
+    desc: Remove build artifacts and caches
+    cmds:
+      - rm -rf .task/ __pycache__/ .pytest_cache/ .ruff_cache/ dist/ build/ *.egg-info/
+
+  resume:
+    desc: Show RESUME.md
+    cmds:
+      - cat RESUME.md 2>/dev/null || echo "No RESUME.md found."
+
+  readme:
+    desc: Show README.md
+    cmds:
+      - cmd: bat README.md 2>/dev/null || cat README.md

@@ -1,0 +1,108 @@
+{
+  "id": "prompt-ollama-v1",
+  "name": "Prompt-Driven Ollama",
+  "active": true,
+  "nodes": [
+    {
+      "id": "webhook-trigger",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "position": [240, 340],
+      "parameters": {
+        "path": "prompt-ollama",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "typeVersion": 2,
+      "webhookId": "prompt-ollama-webhook-id"
+    },
+    {
+      "id": "fetch-prompt",
+      "name": "Fetch Prompt",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [460, 340],
+      "parameters": {
+        "method": "GET",
+        "url": "=http://mlflow:5050/api/2.0/mlflow/registered-models/get",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "name",
+              "value": "={{ $json.body.prompt_name }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "typeVersion": 4.2
+    },
+    {
+      "id": "resolve-and-render",
+      "name": "Resolve & Render",
+      "type": "n8n-nodes-base.code",
+      "position": [680, 340],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const rm = $input.item.json.registered_model;\nconst webhookData = $('Webhook').first().json.body;\nconst requestedAlias = webhookData.alias || 'production';\n\n// Resolve alias to version number\nconst aliasEntry = (rm.aliases || []).find(a => a.alias === requestedAlias);\nif (!aliasEntry) {\n  throw new Error(`Alias '${requestedAlias}' not found on prompt '${rm.name}'. Available: ${(rm.aliases || []).map(a => a.alias).join(', ')}`);\n}\nconst targetVersion = aliasEntry.version;\n\n// Find the matching version in latest_versions\nconst mv = (rm.latest_versions || []).find(v => v.version === targetVersion);\nif (!mv) {\n  throw new Error(`Version ${targetVersion} not found in latest_versions for '${rm.name}'`);\n}\n\n// Extract prompt template from tags\nconst tags = mv.tags || [];\nconst promptTag = tags.find(t => t.key === 'mlflow.prompt.text');\nif (!promptTag) {\n  throw new Error('No mlflow.prompt.text tag found on model version');\n}\n\nlet template = promptTag.value;\n\n// Render template variables\nconst variables = webhookData.variables || {};\nfor (const [key, value] of Object.entries(variables)) {\n  const pattern = new RegExp(`\\\\{\\\\{\\\\s*${key}\\\\s*\\\\}\\\\}`, 'g');\n  template = template.replace(pattern, String(value));\n}\n\nconst unresolved = template.match(/\\{\\{\\s*\\w+\\s*\\}\\}/g);\nif (unresolved) {\n  throw new Error(`Unresolved template variables: ${unresolved.join(', ')}`);\n}\n\nreturn {\n  rendered_prompt: template,\n  model: webhookData.model || 'qwen2.5:14b',\n  temperature: webhookData.temperature || 0.7,\n  prompt_name: rm.name,\n  prompt_version: targetVersion\n};"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "call-ollama",
+      "name": "Call Ollama",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [900, 340],
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:11434/v1/chat/completions",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: $json.model, messages: [{role: 'user', content: $json.rendered_prompt}], temperature: $json.temperature }) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "typeVersion": 4.2
+    },
+    {
+      "id": "respond",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [1120, 340],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { response: $json.choices[0].message.content, model: $json.model, usage: $json.usage, prompt_name: $('Resolve & Render').first().json.prompt_name, prompt_version: $('Resolve & Render').first().json.prompt_version } }}"
+      },
+      "typeVersion": 1.1
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [{ "node": "Fetch Prompt", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Prompt": {
+      "main": [
+        [{ "node": "Resolve & Render", "type": "main", "index": 0 }]
+      ]
+    },
+    "Resolve & Render": {
+      "main": [
+        [{ "node": "Call Ollama", "type": "main", "index": 0 }]
+      ]
+    },
+    "Call Ollama": {
+      "main": [
+        [{ "node": "Respond", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

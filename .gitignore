@@ -1,0 +1,52 @@
+# ── Python ──────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+.uv/
+.python-version
+
+# ── Node.js ─────────────────────────────────────
+node_modules/
+
+# ── Docker volumes (local dev data) ─────────────
+pgdata/
+minio-data/
+n8n-data/*
+!n8n-data/workflows/
+data/
+!data/.gitkeep
+
+# ── Secrets (never commit) ──────────────────────
+secrets/
+.env
+.env.local
+
+# ── IDE / Editor ────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── OS ──────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Project-specific ────────────────────────────
+references/
+*.db
+*.sqlite3
+backups/
+
+# ── Test / Coverage ─────────────────────────────
+.pytest_cache/
+htmlcov/
+.coverage
+
+# ── Build / Cache ───────────────────────────────
+.ruff_cache/
+.task/

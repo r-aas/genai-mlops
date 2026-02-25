@@ -1,0 +1,255 @@
+###############################################################################
+# GenAI MLOps Stack — n8n + MLflow
+#
+# Services:
+#   n8n-postgres   — n8n metadata store
+#   mlflow-postgres— MLflow backend store
+#   minio          — S3-compatible artifact storage for MLflow
+#   create-bucket  — init container to create MinIO bucket
+#   mlflow         — experiment tracking, model registry
+#   n8n            — workflow automation
+#
+# Ports:
+#   5050  — MLflow UI
+#   5678  — n8n UI
+#   9000  — MinIO API
+#   9001  — MinIO Console
+#
+# Secrets:
+#   Run `task init-secrets` to generate secrets/. See scripts/init-secrets.sh.
+###############################################################################
+
+secrets:
+  n8n_postgres_password:
+    file: ./secrets/n8n_postgres_password
+  mlflow_postgres_password:
+    file: ./secrets/mlflow_postgres_password
+  minio_root_password:
+    file: ./secrets/minio_root_password
+  n8n_encryption_key:
+    file: ./secrets/n8n_encryption_key
+
+volumes:
+  n8n-pgdata:
+  mlflow-pgdata:
+  minio-data:
+  n8n-data:
+
+networks:
+  mlops-net:
+    name: genai-mlops-network
+
+services:
+  # ── n8n PostgreSQL ────────────────────────────────────────────────────────────
+  n8n-postgres:
+    image: postgres:${N8N_POSTGRES_VERSION:-16.8}
+    container_name: genai-n8n-postgres
+    networks: [mlops-net]
+    secrets:
+      - n8n_postgres_password
+    environment:
+      POSTGRES_USER: ${N8N_POSTGRES_USER:-n8n}
+      POSTGRES_PASSWORD_FILE: /run/secrets/n8n_postgres_password
+      POSTGRES_DB: ${N8N_POSTGRES_DB:-n8n}
+    volumes:
+      - n8n-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${N8N_POSTGRES_USER:-n8n} -d ${N8N_POSTGRES_DB:-n8n}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ── MLflow PostgreSQL ─────────────────────────────────────────────────────────
+  mlflow-postgres:
+    image: postgres:${MLFLOW_POSTGRES_VERSION:-16.8}
+    container_name: genai-mlflow-postgres
+    networks: [mlops-net]
+    secrets:
+      - mlflow_postgres_password
+    environment:
+      POSTGRES_USER: ${MLFLOW_POSTGRES_USER:-mlflow}
+      POSTGRES_PASSWORD_FILE: /run/secrets/mlflow_postgres_password
+      POSTGRES_DB: ${MLFLOW_POSTGRES_DB:-mlflow}
+    volumes:
+      - mlflow-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${MLFLOW_POSTGRES_USER:-mlflow} -d ${MLFLOW_POSTGRES_DB:-mlflow}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ── MinIO — S3-compatible artifact storage ────────────────────────────────────
+  minio:
+    image: minio/minio:${MINIO_VERSION:-RELEASE.2025-04-22T22-12-26Z}
+    container_name: genai-minio
+    networks: [mlops-net]
+    secrets:
+      - minio_root_password
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio_root_password
+    volumes:
+      - minio-data:/data
+    command: server /data --console-address ":9001"
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # ── Bucket init ───────────────────────────────────────────────────────────────
+  create-bucket:
+    image: minio/mc:${MINIO_MC_VERSION:-RELEASE.2025-05-21T01-59-54Z}
+    container_name: genai-create-bucket
+    networks: [mlops-net]
+    secrets:
+      - minio_root_password
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        MINIO_PASS=$$(cat /run/secrets/minio_root_password)
+        mc alias set myminio "http://minio:9000" "${MINIO_ROOT_USER:-minio}" "$$MINIO_PASS"
+        mc mb --ignore-existing "myminio/${MINIO_BUCKET:-mlflow}"
+    restart: "no"
+
+  # ── MLflow — experiment tracking & model registry ─────────────────────────────
+  mlflow:
+    build:
+      context: ./mlflow
+      args:
+        MLFLOW_VERSION: ${MLFLOW_VERSION:-v3.10.0}
+    container_name: genai-mlflow
+    networks: [mlops-net]
+    secrets:
+      - mlflow_postgres_password
+      - minio_root_password
+    depends_on:
+      mlflow-postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      create-bucket:
+        condition: service_completed_successfully
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      MLFLOW_ARTIFACTS_DESTINATION: s3://${MINIO_BUCKET:-mlflow}/
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+    command:
+      - /bin/bash
+      - -c
+      - |
+        export POSTGRES_PASSWORD=$$(cat /run/secrets/mlflow_postgres_password)
+        export AWS_SECRET_ACCESS_KEY=$$(cat /run/secrets/minio_root_password)
+        mlflow server \
+          --backend-store-uri "postgresql://${MLFLOW_POSTGRES_USER:-mlflow}:$${POSTGRES_PASSWORD}@mlflow-postgres:5432/${MLFLOW_POSTGRES_DB:-mlflow}" \
+          --artifacts-destination "$${MLFLOW_ARTIFACTS_DESTINATION}" \
+          --serve-artifacts \
+          --host 0.0.0.0 \
+          --port ${MLFLOW_PORT:-5050} \
+          --allowed-hosts "mlflow:5050,mlflow,localhost,localhost:5050,0.0.0.0"
+    ports:
+      - "${MLFLOW_PORT:-5050}:${MLFLOW_PORT:-5050}"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:${MLFLOW_PORT:-5050}/health')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  # ── n8n — workflow automation ─────────────────────────────────────────────────
+  n8n:
+    image: n8nio/n8n:${N8N_VERSION:-1.123.21}
+    container_name: genai-n8n
+    networks: [mlops-net]
+    secrets:
+      - n8n_postgres_password
+      - n8n_encryption_key
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      n8n-postgres:
+        condition: service_healthy
+    environment:
+      N8N_HOST: 0.0.0.0
+      N8N_PORT: 5678
+      GENERIC_TIMEZONE: ${TIMEZONE:-America/Denver}
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: n8n-postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${N8N_POSTGRES_DB:-n8n}
+      DB_POSTGRESDB_USER: ${N8N_POSTGRES_USER:-n8n}
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      NODE_FUNCTION_ALLOW_EXTERNAL: "*"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        export N8N_ENCRYPTION_KEY=$$(cat /run/secrets/n8n_encryption_key)
+        export DB_POSTGRESDB_PASSWORD=$$(cat /run/secrets/n8n_postgres_password)
+        exec n8n
+    ports:
+      - "${N8N_PORT:-5678}:5678"
+    volumes:
+      - n8n-data:/home/node/.n8n
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5678/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── n8n workflow import (one-shot) ──────────────────────────────────────────
+  n8n-import:
+    image: n8nio/n8n:${N8N_VERSION:-1.123.21}
+    container_name: genai-n8n-import
+    networks: [mlops-net]
+    secrets:
+      - n8n_postgres_password
+      - n8n_encryption_key
+    depends_on:
+      n8n:
+        condition: service_healthy
+    volumes:
+      - ./n8n-data:/demo-data
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        export N8N_ENCRYPTION_KEY=$$(cat /run/secrets/n8n_encryption_key)
+        export DB_POSTGRESDB_PASSWORD=$$(cat /run/secrets/n8n_postgres_password)
+        if [ -z "$$(n8n list:workflow --onlyId 2>/dev/null)" ]; then
+          n8n import:workflow --separate --input=/demo-data/workflows
+          n8n update:workflow --id=ollama-webhook-v1 --active=true
+          n8n update:workflow --id=prompt-ollama-v1 --active=true
+          n8n update:workflow --id=prompt-crud-v1 --active=true
+          n8n update:workflow --id=prompt-eval-v1 --active=true
+          echo "Workflows imported and activated."
+        else
+          echo "Workflows already exist, skipping import."
+        fi
+    environment:
+      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "false"
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: n8n-postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${N8N_POSTGRES_DB:-n8n}
+      DB_POSTGRESDB_USER: ${N8N_POSTGRES_USER:-n8n}
+    restart: "no"

@@ -1,0 +1,103 @@
+{
+  "id": "ollama-webhook-v1",
+  "name": "Ollama Webhook",
+  "active": true,
+  "nodes": [
+    {
+      "id": "webhook-trigger",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "position": [240, 340],
+      "parameters": {
+        "path": "ollama",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "typeVersion": 2,
+      "webhookId": "ollama-webhook-id"
+    },
+    {
+      "id": "format-request",
+      "name": "Format Request",
+      "type": "n8n-nodes-base.set",
+      "position": [460, 340],
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "model",
+              "name": "model",
+              "value": "={{ $json.body.model || 'qwen2.5:14b' }}",
+              "type": "string"
+            },
+            {
+              "id": "messages",
+              "name": "messages",
+              "value": "={{ [{\"role\": \"user\", \"content\": $json.body.message}] }}",
+              "type": "array"
+            },
+            {
+              "id": "temperature",
+              "name": "temperature",
+              "value": "={{ $json.body.temperature || 0.7 }}",
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "typeVersion": 3.4
+    },
+    {
+      "id": "call-ollama",
+      "name": "Call Ollama",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [680, 340],
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:11434/v1/chat/completions",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: $json.model, messages: $json.messages, temperature: $json.temperature }) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "typeVersion": 4.2
+    },
+    {
+      "id": "respond",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [900, 340],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { response: $json.choices[0].message.content, model: $json.model, usage: $json.usage } }}"
+      },
+      "typeVersion": 1.1
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [{ "node": "Format Request", "type": "main", "index": 0 }]
+      ]
+    },
+    "Format Request": {
+      "main": [
+        [{ "node": "Call Ollama", "type": "main", "index": 0 }]
+      ]
+    },
+    "Call Ollama": {
+      "main": [
+        [{ "node": "Respond", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

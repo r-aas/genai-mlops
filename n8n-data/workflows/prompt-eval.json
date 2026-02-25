@@ -1,0 +1,79 @@
+{
+  "id": "prompt-eval-v1",
+  "name": "Prompt Evaluation",
+  "active": true,
+  "nodes": [
+    {
+      "id": "webhook",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "position": [
+        240,
+        340
+      ],
+      "parameters": {
+        "path": "eval",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "typeVersion": 2,
+      "webhookId": "prompt-eval-webhook-id"
+    },
+    {
+      "id": "eval-handler",
+      "name": "Eval Handler",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        480,
+        340
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const axios = require('axios');\nconst M = 'http://mlflow:5050/api/2.0/mlflow';\nconst OLLAMA = 'http://host.docker.internal:11434/v1/chat/completions';\nconst body = $input.item.json.body;\n\ntry {\n\nif (!body.prompt_name) throw new Error('prompt_name required');\nif (!body.test_cases || !body.test_cases.length) throw new Error('test_cases array required');\n\nasync function post(path, data) {\n  var r = await axios.post(M + path, data);\n  return r.data;\n}\n\nasync function apiGet(path) {\n  var r = await axios.get(M + path);\n  return r.data;\n}\n\n// 1. Fetch prompt\nvar promptName = body.prompt_name;\nvar alias = body.alias || 'production';\nvar rm = await apiGet('/registered-models/get?name=' + encodeURIComponent(promptName));\nvar model = rm.registered_model;\nvar ae = (model.aliases || []).find(function(a) { return a.alias === alias; });\nif (!ae) throw new Error('Alias ' + alias + ' not found on ' + promptName);\nvar mv = (model.latest_versions || []).find(function(v) { return v.version === ae.version; });\nif (!mv) throw new Error('Version ' + ae.version + ' not found');\nvar vTags = mv.tags || [];\nvar pt = vTags.find(function(t) { return t.key === 'mlflow.prompt.text'; });\nif (!pt) throw new Error('No mlflow.prompt.text tag found');\nvar template = pt.value;\nvar promptVersion = mv.version;\n\n// 2. Get or create experiment\nvar expName = body.experiment_name || (promptName + '-eval');\nvar expId;\ntry {\n  var expRes = await apiGet('/experiments/get-by-name?experiment_name=' + encodeURIComponent(expName));\n  expId = expRes.experiment.experiment_id;\n} catch(e) {\n  var createRes = await post('/experiments/create', {name: expName});\n  expId = createRes.experiment_id;\n}\n\n// 3. Run each test case\nvar llmModel = body.model || 'qwen2.5:14b';\nvar temperature = body.temperature || 0.7;\nvar results = [];\nvar totalLatency = 0;\nvar totalTokens = 0;\n\nfor (var i = 0; i < body.test_cases.length; i++) {\n  var tc = body.test_cases[i];\n  var vars = tc.variables || {};\n  var label = tc.label || ('case-' + i);\n\n  // Render template\n  var rendered = template;\n  for (var k of Object.keys(vars)) {\n    var pattern = new RegExp('\\\\{\\\\{\\\\s*' + k + '\\\\s*\\\\}\\\\}', 'g');\n    rendered = rendered.replace(pattern, String(vars[k]));\n  }\n\n  // Create run\n  var startTime = Date.now();\n  var runRes = await post('/runs/create', {\n    experiment_id: expId,\n    start_time: startTime,\n    run_name: label\n  });\n  var runId = runRes.run.info.run_id;\n\n  // Call Ollama\n  var ollamaRes;\n  try {\n    ollamaRes = await axios.post(OLLAMA, {\n      model: llmModel,\n      messages: [{role: 'user', content: rendered}],\n      temperature: temperature\n    }, {timeout: 120000});\n  } catch(ollamaErr) {\n    var endTime = Date.now();\n    await post('/runs/update', {run_id: runId, status: 'FAILED', end_time: endTime});\n    results.push({label: label, run_id: runId, error: ollamaErr.message, latency_ms: endTime - startTime});\n    continue;\n  }\n\n  var endTime = Date.now();\n  var latencyMs = endTime - startTime;\n  var response = ollamaRes.data.choices[0].message.content;\n  var usage = ollamaRes.data.usage || {};\n  var promptTokens = usage.prompt_tokens || 0;\n  var completionTokens = usage.completion_tokens || 0;\n  var usedTokens = usage.total_tokens || (promptTokens + completionTokens);\n\n  // Log batch\n  await post('/runs/log-batch', {\n    run_id: runId,\n    params: [\n      {key: 'prompt_name', value: promptName},\n      {key: 'prompt_version', value: String(promptVersion)},\n      {key: 'prompt_alias', value: alias},\n      {key: 'model', value: llmModel},\n      {key: 'temperature', value: String(temperature)},\n      {key: 'input', value: rendered.substring(0, 5000)},\n      {key: 'label', value: label}\n    ],\n    metrics: [\n      {key: 'latency_ms', value: latencyMs, timestamp: endTime, step: 0},\n      {key: 'prompt_tokens', value: promptTokens, timestamp: endTime, step: 0},\n      {key: 'completion_tokens', value: completionTokens, timestamp: endTime, step: 0},\n      {key: 'total_tokens', value: usedTokens, timestamp: endTime, step: 0}\n    ],\n    tags: [\n      {key: 'label', value: label},\n      {key: 'prompt_name', value: promptName},\n      {key: 'mlflow.note.content', value: response.substring(0, 5000)}\n    ]\n  });\n\n  // Finish run\n  await post('/runs/update', {run_id: runId, status: 'FINISHED', end_time: endTime});\n\n  totalLatency += latencyMs;\n  totalTokens += usedTokens;\n\n  results.push({\n    label: label,\n    run_id: runId,\n    response: response,\n    latency_ms: latencyMs,\n    tokens: {prompt: promptTokens, completion: completionTokens, total: usedTokens}\n  });\n}\n\nvar n = results.length;\nreturn {\n  prompt_name: promptName,\n  prompt_version: promptVersion,\n  model: llmModel,\n  experiment_name: expName,\n  results: results,\n  summary: {\n    total: n,\n    avg_latency_ms: n > 0 ? Math.round(totalLatency / n) : 0,\n    avg_tokens: n > 0 ? Math.round(totalTokens / n) : 0\n  }\n};\n\n} catch(e) {\n  var msg = e.message || String(e);\n  if (e.response && e.response.data) msg += ' | ' + JSON.stringify(e.response.data);\n  return {error: true, message: msg};\n}"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "respond",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [
+        720,
+        340
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}"
+      },
+      "typeVersion": 1.1
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Eval Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Eval Handler": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
