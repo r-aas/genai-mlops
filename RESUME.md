@@ -1,16 +1,26 @@
 # RESUME.md — GenAI MLOps Stack
 
-## What Was Built
+## Current State (v0.5 — cleanup + git init)
 
-### Prompt Evaluation Workflow (v0.4)
-- **n8n workflow**: `n8n-data/workflows/prompt-eval.json` — 3-node workflow:
-  Webhook → Eval Handler (Code/axios) → Respond
-- **Endpoint**: `POST /webhook/eval`
-- Runs prompt against test cases, logs results to MLflow experiment tracking
-- Each test case: fetch prompt → render → call Ollama → measure latency → log to MLflow run
-- Auto-creates experiment per prompt (`{prompt_name}-eval`)
+### Git
+- Initialized on `main` branch, initial commit `8edb2be`
+- 16 files tracked, `.gitignore` carves out `n8n-data/workflows/` from the `n8n-data/*` ignore
+- No remote configured yet
 
-### Eval API Reference
+### Active Workflows (4)
+| ID | Endpoint | Purpose |
+|----|----------|---------|
+| `ollama-webhook-v1` | `POST /webhook/ollama` | Direct Ollama passthrough |
+| `prompt-ollama-v1` | `POST /webhook/prompt-ollama` | Prompt-driven Ollama with registry lookup |
+| `prompt-crud-v1` | `POST /webhook/prompts` | Prompt registry CRUD (create/get/list/update/delete) |
+| `prompt-eval-v1` | `POST /webhook/eval` | Prompt evaluation → MLflow experiment tracking |
+
+### Cleanup Done This Session
+- Deleted stale `test-code-v1` debugging workflow from n8n (no JSON file, direct DB delete)
+- Initialized git repo, branch `main`, initial commit with all 16 project files
+- Updated `.gitignore` to track `n8n-data/workflows/` while ignoring rest of `n8n-data/`
+
+## Eval API Reference
 ```
 POST /webhook/eval
 {
@@ -26,44 +36,21 @@ POST /webhook/eval
 }
 ```
 
-Response includes per-test results (response, latency_ms, tokens, run_id) + summary (avg_latency, avg_tokens).
+Response: per-test results (response, latency_ms, tokens, run_id) + summary (avg_latency, avg_tokens).
 
-### MLflow REST API Endpoints Used
-- `/experiments/get-by-name` + `/experiments/create` — get-or-create experiment
-- `/runs/create` — start a run
-- `/runs/log-batch` — log params + metrics + tags in single call
-- `/runs/update` — set status to FINISHED
-
-### Key Discovery: DNS Rebinding with Port
-- MLflow `--allowed-hosts` needs `localhost:5050` (with port), not just `localhost`
-- curl sends `Host: localhost:5050` when hitting `http://localhost:5050`
-- Updated docker-compose to include both `localhost` and `localhost:5050`
-- `docker compose restart` does NOT re-read compose file — must use `docker compose up -d` to recreate
-
-### Key Discovery: Shell Variable Expansion in Workflow Generation
-- `python3 -c "..."` with double quotes causes shell to expand `$input` to empty string
-- Must use heredoc (`python3 << 'PYEOF'`) to preserve `$input` in n8n Code node references
-- Always verify `$input` presence in generated JSON before importing
-
-## What Broke and Why
-- **`$input` eaten by shell**: `python3 -c "...$input..."` expanded `$input` to empty. Fixed with heredoc.
-- **DNS rebinding from host**: `localhost:5050` not in allowed-hosts (only `localhost` without port). Fixed by adding `localhost:5050`.
-- **`docker compose restart` stale config**: Restart reuses existing container config. Must `docker compose up -d` to pick up compose changes.
+## Key Discoveries (Preserved)
+- **DNS rebinding with port**: MLflow `--allowed-hosts` needs `localhost:5050` (with port), not just `localhost`
+- **Shell variable expansion**: `python3 -c "..."` eats `$input`; use heredoc `<< 'PYEOF'` instead
+- **`docker compose restart` vs `up -d`**: `restart` reuses existing config; `up -d` recreates with updated compose
+- **n8n Code Node**: VM2 sandbox, no `fetch`, must use `require('axios')`
+- **n8n CLI delete**: No `delete:workflow` command; must delete via Postgres directly
 
 ## Verified Working
-- `task import-workflow` — imports and activates all 4 workflows
-- `POST /webhook/eval` with `assistant` prompt — 3 runs logged to `assistant-eval` experiment
-- `POST /webhook/eval` with `summarizer` prompt — 1 run logged to `summarizer-eval` experiment
-- MLflow UI shows experiments with runs, params (prompt_name, version, model, label), metrics (latency_ms, token counts)
+- All 4 webhooks responding
+- MLflow experiments: `assistant-eval` (6 runs), `summarizer-eval` (1 run)
+- `task import-workflow` imports and activates all 4 workflows
 - Host→MLflow API queries work after allowed-hosts fix
-- All previous workflows still working (ollama, prompt-ollama, prompts CRUD)
-
-## Previous Session Work (Preserved)
-- Prompt CRUD workflow (`prompt-crud.json`) — 5 actions via single webhook
-- Prompt-driven workflow (`prompt-ollama.json`) — 5-node workflow
-- Seed script (`scripts/seed_prompts.py`) — seeds assistant + summarizer prompts
-- MLflow `--allowed-hosts` fix for DNS rebinding protection
-- n8n Code Node constraints (VM2 sandbox, no fetch, use axios)
+- `task dev` / `task stop` lifecycle clean
 
 ## Next Steps
 - [local] Test `task nuke && task dev` for full bootstrap from scratch
@@ -72,3 +59,4 @@ Response includes per-test results (response, latency_ms, tokens, run_id) + summ
 - Add comparative eval (run same test cases across 2 prompt versions, compare metrics)
 - Consider n8n API key setup for programmatic workflow management
 - Consider batch prompt operations (import/export multiple prompts)
+- Create GitHub remote and push
