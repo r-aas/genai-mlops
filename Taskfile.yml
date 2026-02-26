@@ -142,11 +142,11 @@ tasks:
         check uv --version
         check curl --version
         echo ""
-        echo "── Ollama ──"
-        if curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then
-          echo "  ✓ Ollama             http://localhost:11434"
+        echo "── Inference Provider ──"
+        if curl -sf http://localhost:11434/v1/models >/dev/null 2>&1; then
+          echo "  ✓ Inference          http://localhost:11434/v1 (OpenAI-compatible)"
         else
-          echo "  ✗ Ollama             NOT REACHABLE at http://localhost:11434"
+          echo "  ✗ Inference          NOT REACHABLE at http://localhost:11434/v1"
           ok=false
         fi
         echo ""

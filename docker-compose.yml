@@ -197,6 +197,9 @@ services:
       DB_POSTGRESDB_USER: ${N8N_POSTGRES_USER:-n8n}
       N8N_DIAGNOSTICS_ENABLED: "false"
       NODE_FUNCTION_ALLOW_EXTERNAL: "*"
+      INFERENCE_BASE_URL: ${INFERENCE_BASE_URL:-http://host.docker.internal:11434/v1}
+      INFERENCE_DEFAULT_MODEL: ${INFERENCE_DEFAULT_MODEL:-qwen2.5:14b}
+      INFERENCE_ALLOWED_MODELS: ${INFERENCE_ALLOWED_MODELS:-qwen2.5:14b,qwen2.5:7b,qwen3:32b,qwen3:30b,mistral:7b-instruct,llama3.2:latest,nomic-embed-text:latest}
     entrypoint:
       - /bin/sh
       - -c
