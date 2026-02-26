@@ -1,0 +1,218 @@
+{
+  "id": "openai-compat-v1",
+  "name": "OpenAI-Compatible API",
+  "nodes": [
+    {
+      "id": "n1",
+      "name": "GET /v1/models",
+      "type": "n8n-nodes-base.webhook",
+      "position": [
+        260,
+        300
+      ],
+      "webhookId": "compat-models",
+      "parameters": {
+        "path": "v1/models",
+        "httpMethod": "GET",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "n2",
+      "name": "List Models",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        480,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const axios = require('axios');\nconst M = 'http://mlflow:5050/api/2.0/mlflow';\nconst OLLAMA = 'http://host.docker.internal:11434';\nconst models = [];\n\n// Prompt-enhanced models from MLflow registry\ntry {\n  const resp = await axios.get(M + '/registered-models/search', { params: { max_results: 100 } });\n  for (const m of (resp.data.registered_models || [])) {\n    models.push({ id: m.name, object: 'model', created: Math.floor(m.creation_timestamp / 1000), owned_by: 'genai-mlops' });\n  }\n} catch (e) { /* MLflow unavailable */ }\n\n// Raw Ollama models\ntry {\n  const resp = await axios.get(OLLAMA + '/api/tags');\n  for (const m of (resp.data.models || [])) {\n    models.push({ id: m.name, object: 'model', created: Math.floor(new Date(m.modified_at).getTime() / 1000), owned_by: 'ollama' });\n  }\n} catch (e) { /* Ollama unavailable */ }\n\nreturn [{ json: { object: 'list', data: models } }];"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "n3",
+      "name": "Models Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [
+        700,
+        300
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {}
+      },
+      "typeVersion": 1.2
+    },
+    {
+      "id": "n4",
+      "name": "POST /v1/chat/completions",
+      "type": "n8n-nodes-base.webhook",
+      "position": [
+        260,
+        600
+      ],
+      "webhookId": "compat-chat",
+      "parameters": {
+        "path": "v1/chat/completions",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "n5",
+      "name": "Chat Handler",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        480,
+        600
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const axios = require('axios');\nconst OLLAMA = 'http://host.docker.internal:11434/v1/chat/completions';\nconst body = $input.item.json.body;\nconst model = body.model;\nconst messages = body.messages || [];\nconst stream = body.stream || false;\nconst temperature = body.temperature !== undefined ? body.temperature : 0.7;\n\n// Extract last user message\nconst lastUserMsg = [...messages].reverse().find(m => m.role === 'user');\nif (!lastUserMsg) throw new Error('No user message found');\nconst userInput = typeof lastUserMsg.content === 'string'\n  ? lastUserMsg.content\n  : Array.isArray(lastUserMsg.content)\n    ? lastUserMsg.content.filter(c => c.type === 'text').map(c => c.text).join('\\n')\n    : String(lastUserMsg.content);\n\nlet response, usage, promptInfo;\n\n// Try prompt-enhanced path first (MLflow prompt registry)\ntry {\n  const pr = await axios.post('http://localhost:5678/webhook/prompt-ollama', {\n    prompt_name: model, variables: { message: userInput }, alias: 'production'\n  }, { timeout: 120000 });\n  if (pr.data && pr.data.response) {\n    response = pr.data.response;\n    usage = pr.data.usage || {};\n    promptInfo = { name: pr.data.prompt_name, version: pr.data.prompt_version };\n  } else {\n    throw new Error('Prompt not found, falling back to Ollama');\n  }\n} catch (err) {\n  // Fallback: direct Ollama pass-through (model name is an actual Ollama model)\n  const or = await axios.post(OLLAMA, {\n    model, messages, temperature, stream: false\n  }, { timeout: 120000 });\n  response = or.data.choices[0].message.content;\n  usage = or.data.usage || {};\n  promptInfo = null;\n}\n\nconst cid = 'chatcmpl-' + Date.now();\nconst ts = Math.floor(Date.now() / 1000);\nconst fp = promptInfo ? 'fp_' + promptInfo.name + '_v' + promptInfo.version : 'fp_ollama';\n\nif (stream) {\n  const chunk = { id: cid, object: 'chat.completion.chunk', created: ts, model,\n    system_fingerprint: fp,\n    choices: [{ index: 0, delta: { role: 'assistant', content: response }, finish_reason: 'stop' }] };\n  return [{ json: { _stream: true, stream_data: 'data: ' + JSON.stringify(chunk) + '\\n\\ndata: [DONE]\\n\\n' } }];\n}\n\nreturn [{ json: { _stream: false, completion: {\n  id: cid, object: 'chat.completion', created: ts, model, system_fingerprint: fp,\n  choices: [{ index: 0, message: { role: 'assistant', content: response }, finish_reason: 'stop' }],\n  usage: { prompt_tokens: usage.prompt_tokens || 0, completion_tokens: usage.completion_tokens || 0, total_tokens: usage.total_tokens || 0 }\n} } }];"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "n6",
+      "name": "Is Stream?",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        700,
+        600
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "sc",
+              "leftValue": "={{ $json._stream }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "typeVersion": 2.2
+    },
+    {
+      "id": "n7",
+      "name": "Stream Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [
+        920,
+        520
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.stream_data }}",
+        "options": {}
+      },
+      "typeVersion": 1.2
+    },
+    {
+      "id": "n8",
+      "name": "JSON Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [
+        920,
+        680
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json.completion }}",
+        "options": {}
+      },
+      "typeVersion": 1.2
+    }
+  ],
+  "connections": {
+    "GET /v1/models": {
+      "main": [
+        [
+          {
+            "node": "List Models",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "List Models": {
+      "main": [
+        [
+          {
+            "node": "Models Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "POST /v1/chat/completions": {
+      "main": [
+        [
+          {
+            "node": "Chat Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chat Handler": {
+      "main": [
+        [
+          {
+            "node": "Is Stream?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Stream?": {
+      "main": [
+        [
+          {
+            "node": "Stream Response",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "JSON Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {},
+  "pinData": {},
+  "tags": [],
+  "meta": {
+    "instanceId": "genai-mlops"
+  }
+}

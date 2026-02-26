@@ -241,6 +241,7 @@ services:
           n8n update:workflow --id=prompt-ollama-v1 --active=true
           n8n update:workflow --id=prompt-crud-v1 --active=true
           n8n update:workflow --id=prompt-eval-v1 --active=true
+          n8n update:workflow --id=openai-compat-v1 --active=true
           echo "Workflows imported and activated."
         else
           echo "Workflows already exist, skipping import."
