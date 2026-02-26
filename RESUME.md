@@ -1,22 +1,22 @@
 # RESUME.md — GenAI MLOps Stack
 
-## Current State (v0.7 — Provider-agnostic inference)
+## Current State (v0.8 — Consolidated API surface)
 
 ### Git
 - Branch `main`, remote `origin` → https://github.com/r-aas/genai-mlops (public)
 - `.gitignore` carves out `n8n-data/workflows/` from the `n8n-data/*` ignore
 
-### Active Workflows (5)
+### Active Workflows (3)
 | ID | Endpoint | Purpose |
 |----|----------|---------|
-| `ollama-webhook-v1` | `POST /webhook/ollama` | Direct inference passthrough |
-| `prompt-ollama-v1` | `POST /webhook/prompt-ollama` | Prompt-driven inference with registry lookup |
+| `openai-compat-v1` | `GET/POST /webhook/v1/*` | OpenAI-compatible API (models + chat completions) |
 | `prompt-crud-v1` | `POST /webhook/prompts` | Prompt registry CRUD (create/get/list/update/delete) |
 | `prompt-eval-v1` | `POST /webhook/eval` | Prompt evaluation → MLflow experiment tracking |
-| `openai-compat-v1` | `GET/POST /webhook/v1/*` | OpenAI-compatible API (models + chat completions) |
 
-### Provider Abstraction (v0.7)
-All 4 inference workflows now use env vars instead of hardcoded Ollama URLs:
+Removed `ollama-webhook-v1` and `prompt-ollama-v1` — their functionality is fully inlined in `openai-compat-v1`.
+
+### Provider Abstraction
+All inference workflows use env vars instead of hardcoded URLs:
 
 | Env Var | Default | Purpose |
 |---------|---------|---------|
@@ -27,16 +27,17 @@ All 4 inference workflows now use env vars instead of hardcoded Ollama URLs:
 - n8n expression fields use `$env.INFERENCE_BASE_URL`
 - n8n Code nodes use `process.env.INFERENCE_BASE_URL`
 - All have hardcoded fallback defaults so stack works without .env
-- Taskfile `doctor` now checks `/v1/models` (OpenAI-compatible) instead of `/api/tags` (Ollama-specific)
+- Taskfile `doctor` checks `/v1/models` (OpenAI-compatible) instead of `/api/tags`
 
 ### OpenAI-Compatible API
 Gateway that exposes the entire stack as an OpenAI drop-in replacement:
 - `GET /webhook/v1/models` — lists MLflow prompts (`owned_by: genai-mlops`) + allowed models (`owned_by: ollama`)
 - `POST /webhook/v1/chat/completions` — routes by model name:
-  - If model matches an MLflow prompt → prompt-enhanced path (template + inference)
+  - If model matches an MLflow prompt → prompt-enhanced path (template rendering + inference)
   - Otherwise → direct inference pass-through (must be in allowlist)
+  - Prompt lookup is inlined (direct MLflow API call, no workflow delegation)
   - Supports both `stream: true` (SSE) and `stream: false` (JSON)
-  - `system_fingerprint` reveals path taken: `fp_{prompt}_v{version}` or `fp_ollama`
+  - `system_fingerprint` reveals path taken: `fp_{prompt}_v{version}` or `fp_inference`
 
 Usage with OpenAI SDK:
 ```python
@@ -70,19 +71,17 @@ Response: per-test results (response, latency_ms, tokens, run_id) + summary (avg
 - **n8n Code Node**: VM2 sandbox, no `fetch`, must use `require('axios')`
 - **n8n CLI delete**: No `delete:workflow` command; must delete via Postgres directly
 - **n8n CLI import needs secrets**: `docker exec` can't access DB secrets; must use `docker compose run --rm n8n-import`
-- **prompt-ollama empty 200**: Returns 200 with empty body for non-existent prompts; callers must validate response body
 - **n8n env var access**: Expression fields use `$env.VAR`, Code nodes use `process.env.VAR`
 - **Workflow JSON editing**: Don't edit escaped JS in JSON by hand; regenerate via Python `json.dump()`
 
 ## Verified Working
-- All 5 webhooks responding
+- All 3 webhooks responding (old endpoints return 404)
+- Prompt lookup inlined in Chat Handler (direct MLflow call, no workflow delegation)
 - Provider abstraction: all workflows use `INFERENCE_*` env vars with fallback defaults
 - OpenAI SDK drop-in works for both prompt-enhanced and raw models
 - Model allowlist: 7 curated SFW models, enforced on both listing and execution
-- MLflow experiments: `assistant-eval` (6 runs), `summarizer-eval` (1 run)
-- `task import-workflow` imports and activates all 5 workflows
+- `task import-workflow` imports and activates all 3 workflows
 - `task doctor` checks OpenAI-compatible `/v1/models` endpoint
-- Host→MLflow API queries work after allowed-hosts fix
 - `task dev` / `task stop` lifecycle clean
 
 ## Next Steps
@@ -92,4 +91,3 @@ Response: per-test results (response, latency_ms, tokens, run_id) + summary (avg
 - Add comparative eval (run same test cases across 2 prompt versions, compare metrics)
 - Consider n8n API key setup for programmatic workflow management
 - Consider batch prompt operations (import/export multiple prompts)
-- Fix prompt-ollama to return 404/error for non-existent prompts instead of empty 200

@@ -199,8 +199,6 @@ tasks:
           export N8N_ENCRYPTION_KEY=$(cat /run/secrets/n8n_encryption_key)
           export DB_POSTGRESDB_PASSWORD=$(cat /run/secrets/n8n_postgres_password)
           n8n import:workflow --separate --input=/demo-data/workflows
-          n8n update:workflow --id=ollama-webhook-v1 --active=true
-          n8n update:workflow --id=prompt-ollama-v1 --active=true
           n8n update:workflow --id=prompt-crud-v1 --active=true
           n8n update:workflow --id=prompt-eval-v1 --active=true
           n8n update:workflow --id=openai-compat-v1 --active=true
